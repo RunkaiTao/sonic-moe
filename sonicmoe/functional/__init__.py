@@ -450,6 +450,27 @@ def moe_TC_softmax_topk_layer(
 # We assume sorted_selected_T is already SORTED ascendingly !!!
 #   and len(sorted_selected_T) = len(selected_E) = len(router_scores_selected)
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# Runkai's Remark #25
+# Function: moe_general_routing_inputs
+# Purpose: Execute MoE forward pass using precomputed general routing assignments (from hybrid TC/EC routing)
+#
+# Inputs:
+# - x: torch.Tensor [T, H] - Input token embeddings (T tokens, H hidden dimensions)
+# - router_scores_selected: torch.Tensor [TK] - Selected routing scores after hybrid TC/EC routing
+# - sorted_selected_T: torch.Tensor [TK] - Token IDs sorted by token index for coalesced memory access
+# - selected_E: torch.Tensor [TK] - Corresponding expert IDs for each token-expert assignment
+# - w1: torch.Tensor [2*I, H, E] - Up-projection weights for all experts (2*I for gate and up, I = intermediate size)
+# - b1: torch.Tensor [2*I, E] or None - Up-projection biases (optional)
+# - w2: torch.Tensor [H, I, E] - Down-projection weights for all experts
+# - b2: torch.Tensor [H, E] or None - Down-projection biases (optional)
+# - E: int - Total number of experts
+# - stream_id: int - CUDA stream ID for kernel synchronization
+# - is_inference_mode_enabled: bool - Whether inference mode is enabled (default: False)
+#
+# Outputs:
+# - o: torch.Tensor [T, H] - Final MoE output after weighted aggregation of expert results
+# - expert_frequency: torch.Tensor [E] - Number of tokens assigned to each expert
+
 def moe_general_routing_inputs(
     x: torch.Tensor,
     router_scores_selected: torch.Tensor,
@@ -463,6 +484,7 @@ def moe_general_routing_inputs(
     stream_id: int,
     is_inference_mode_enabled: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    
     assert ((b1 is None) and (b2 is None)) or (
         (b1 is not None) and (b2 is not None)
     ), "b1 and b2 has to be None or not None at the same time!"
@@ -470,10 +492,57 @@ def moe_general_routing_inputs(
     T = x.size(0)
     TK = router_scores_selected.size(0)
     E = w2.size(-1)
+    # Runkai's Remark #28
+    # Compute routing metadata needed for efficient MoE execution from general routing results
+    # This function is defined at line 38-62 of this file
+    #
+    # Function: general_routing_router_metadata (see lines 38-62)
+    # Inputs:
+    # - router_scores_selected: [TK] Selected routing scores
+    # - sorted_selected_T: [TK] Token IDs sorted by token index
+    # - selected_E: [TK] Corresponding expert IDs
+    # - T: Number of tokens, E: Number of experts
+    #
+    # Outputs (6 metadata tensors):
+    # - expert_frequency: [E] Count of tokens assigned to each expert (computed via count_cumsum)
+    # - expert_offset: [E+1] Cumulative sum for expert workload offsets (0-indexed, starts with 0)
+    # - x_gather_idx: [TK] Token indices after sorting by expert ID (for gathering input tokens)
+    # - s_scatter_idx: [TK] Indices to sort assignments by expert ID (for scattering to experts)
+    # - s_reverse_scatter_idx: [TK] Reverse mapping to unsort after expert computation
+    # - topk_token_offset: [T+1] Cumulative sum for each token's assignment count (for aggregation)
+    #
+    # Example:
+    # Input: sorted_selected_T = [0,0,1,1,2,2,3,3], selected_E = [2,3,0,3,0,3,2,3]
+    # Step 1: Count expert frequency via count_cumsum(selected_E, E=4)
+    #   expert_frequency = [2, 0, 2, 4] (expert 0: 2 tokens, expert 1: 0 tokens, expert 2: 2 tokens, expert 3: 4 tokens)
+    #   expert_offset (cumsum) = [0, 2, 2, 4, 8] (positions where each expert's assignments start)
+    # Step 2: Sort by expert ID: s_scatter_idx = [2,4,0,6,1,3,5,7] (dest2src mapping)
+    #   (positions 2,4 have expert 0; positions 0,6 have expert 2; positions 1,3,5,7 have expert 3)
+    #   After sorting: selected_E becomes [0,0,2,2,3,3,3,3] (grouped by expert)
+    # Step 3: Reverse mapping: s_reverse_scatter_idx[s_scatter_idx] = [0,1,2,3,4,5,6,7]
+    #   s_reverse_scatter_idx = [2,4,0,5,1,6,3,7] (to restore original order after expert computation) 
+    #   source2dest mapping
+    # Step 4: x_gather_idx = sorted_selected_T[s_scatter_idx] = [1,2,0,3,0,1,2,3] (s_scatter_idx // 2)
+    #   (token IDs in expert-sorted order for gathering inputs)
+    # Step 5: Count token assignment frequency via count_cumsum or bincount
+    #   topk_token_offset = [0, 2, 4, 6, 8] (token 0 has 2 assignments, token 1 has 2, etc.)
     (expert_frequency, expert_offset, x_gather_idx, s_scatter_idx, s_reverse_scatter_idx, topk_token_offset) = (
         general_routing_router_metadata(router_scores_selected, sorted_selected_T, selected_E, T, E)
     )
 
+    # Runkai's Remark #29
+    # Execute the up-projection (first FFN layer) using custom autograd function _UpProjection
+    # This implements the gated activation: output = silu(gate) * up, where gate and up come from w1
+    # The _UpProjection class is defined at lines 94-239 of this file
+    #
+    # Function: _UpProjection.apply (torch.autograd.Function)
+    #
+    # Outputs:
+    # - y1: [TK, I] Intermediate activations after SwiGLU gated activation
+    #       This is the result of silu(gate) * up, where both gate and up are I-dimensional
+    # - z: [TK, 2*I] Combined pre-activation values (concatenation of gate and up projections)
+    #       Contains both the gate projection and up projection before activation
+    #       Saved for backward pass to recompute gradients efficiently
     y1, z = _UpProjection.apply(
         x,
         w1,
@@ -490,6 +559,20 @@ def moe_general_routing_inputs(
         is_inference_mode_enabled,
     )
 
+    # Runkai's Remark #30
+    # Execute the down-projection (second FFN layer) with weighted aggregation using custom autograd function
+    # This projects intermediate activations from I dimensions back to H (hidden size) and aggregates expert outputs
+    # The _DownProjection class is defined at lines 242-408 of this file
+    #
+    # Function: _DownProjection.apply (torch.autograd.Function)
+    # Inputs:
+    #
+    # Output:
+    # - o: [T, H] Final MoE output after weighted aggregation
+    #      Each token's output is the weighted sum of its assigned experts' outputs
+    #
+    # Note: The actual implementation uses efficient CUDA kernels (_down_projection_forward)
+    #       with expert-batched GEMMs and custom weighted reduction kernels
     o = _DownProjection.apply(
         y1,
         z,
@@ -507,4 +590,6 @@ def moe_general_routing_inputs(
         True,  # is_varlen_K
     )
 
+    # Runkai's Remark #31
+    # Return the final MoE output and expert frequency statistics
     return o, expert_frequency
